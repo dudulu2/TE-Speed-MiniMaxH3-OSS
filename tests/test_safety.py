@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,15 +18,15 @@ pm = load_module("patch_model", NODE / "patch_model.py")
 wfmod = load_module("wf_patch", NODE / "tespeed_workflow_patch.py")
 
 
-STOCK_MODEL = '''class MiniMaxH3Model:\n    def __init__(self):\n        self.blocks = []\n\n    def forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):\n        return self._forward(x, timestep, context, transformer_options, minimax_payload, **kwargs)\n\n    def _forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):\n        device = x.device\n        h = x\n        t_emb = None\n        mod_segments = []\n        rope_freqs = None\n        patches_replace = transformer_options.get("patches_replace", {})\n        blocks_replace = patches_replace.get("dit", {})\n        prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)\n        for i, block in enumerate(self.blocks):\n            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)\n            if ("double_block", i) in blocks_replace:\n                def block_wrap(args):\n                    return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],\n                                         transformer_options=args["transformer_options"])}\n                h = blocks_replace[("double_block", i)](\n                    {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,\n                     "transformer_options": transformer_options},\n                    {"original_block": block_wrap})["img"]\n            else:\n                h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)\n        if prefetch_queue is not None:\n            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)\n        return h\n'''
+STOCK_MODEL = '''class MiniMaxH3Model:\n    def __init__(self):\n        self.blocks = []\n\n    def forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):\n        return self._forward(x, timestep, context, transformer_options, minimax_payload, **kwargs)\n\n    def _forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):\n        device = x.device\n        h = x\n        t_emb = None\n        mod_segments = []\n        rope_freqs = None\n        layout = type("Layout", (), {"segments": []})()\n        patches_replace = transformer_options.get("patches_replace", {})\n        blocks_replace = patches_replace.get("dit", {})\n        prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)\n        for i, block in enumerate(self.blocks):\n            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)\n            if ("double_block", i) in blocks_replace:\n                def block_wrap(args):\n                    return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],\n                                         transformer_options=args["transformer_options"])}\n                h = blocks_replace[("double_block", i)](\n                    {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,\n                     "transformer_options": transformer_options},\n                    {"original_block": block_wrap})["img"]\n            else:\n                h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)\n        if prefetch_queue is not None:\n            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)\n        return h\n'''
 
 
-def workflow_fixture():
+def workflow_fixture(producer_type="UNETLoader"):
     return {
         "nodes": [
-            {"id": 1, "type": "UNETLoader", "pos": [0, 0], "inputs": [], "outputs": [{"name": "MODEL", "links": [10, 11]}]},
-            {"id": 2, "type": "BasicScheduler", "pos": [700, 0], "inputs": [{"name": "model", "link": 10}], "outputs": []},
-            {"id": 3, "type": "BasicGuider", "pos": [700, 200], "inputs": [{"name": "model", "link": 11}], "outputs": []},
+            {"id": 1, "type": producer_type, "pos": [0, 0], "inputs": [], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [10, 11]}]},
+            {"id": 2, "type": "BasicScheduler", "pos": [700, 0], "inputs": [{"name": "model", "type": "MODEL", "link": 10}], "outputs": []},
+            {"id": 3, "type": "BasicGuider", "pos": [700, 200], "inputs": [{"name": "model", "type": "MODEL", "link": 11}], "outputs": []},
             {"id": 4, "type": "MiniMaxH3TextToVideo", "pos": [0, 300], "inputs": [], "outputs": []},
         ],
         "links": [
@@ -38,7 +37,36 @@ def workflow_fixture():
     }
 
 
+def lora_workflow_fixture():
+    wf = workflow_fixture("LoraLoaderModelOnly")
+    # Presence of MiniMax H3 node is what identifies the workflow as H3; the
+    # final MODEL producer is intentionally a LoRA node rather than UNETLoader.
+    wf["nodes"].append({
+        "id": 5,
+        "type": "UNETLoader",
+        "pos": [-400, 0],
+        "inputs": [],
+        "outputs": [{"name": "MODEL", "type": "MODEL", "links": [12]}],
+    })
+    producer = wf["nodes"][0]
+    producer["inputs"] = [{"name": "model", "type": "MODEL", "link": 12}]
+    wf["links"].append({"id": 12, "origin_id": 5, "origin_slot": 0, "target_id": 1, "target_slot": 0, "type": "MODEL"})
+    wf["state"]["lastNodeId"] = 5
+    wf["state"]["lastLinkId"] = 12
+    return wf
+
+
 class ModelPatchSafetyTests(unittest.TestCase):
+    def test_preflight_is_no_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            comfy = Path(td) / "ComfyUI"
+            target = comfy / "comfy" / "ldm" / "minimax" / "model.py"
+            target.parent.mkdir(parents=True)
+            target.write_text(STOCK_MODEL, encoding="utf-8")
+            before = target.read_bytes()
+            self.assertEqual(pm.preflight(target), 0)
+            self.assertEqual(before, target.read_bytes())
+
     def test_round_trip_preserves_unrelated_later_edit(self):
         with tempfile.TemporaryDirectory() as td:
             comfy = Path(td) / "ComfyUI"
@@ -48,7 +76,6 @@ class ModelPatchSafetyTests(unittest.TestCase):
             self.assertEqual(pm.install(target), 0)
             patched = target.read_text(encoding="utf-8")
             self.assertIn(pm.RUN_BEGIN, patched)
-            # Simulate a later unrelated ComfyUI/user edit outside our marked regions.
             patched = "# unrelated later edit\n" + patched
             target.write_text(patched, encoding="utf-8")
             self.assertEqual(pm.revert(target), 0)
@@ -78,7 +105,6 @@ class WorkflowSafetyTests(unittest.TestCase):
         status, _ = wfmod.patch_container(wf)
         self.assertEqual(status, "patched")
         te = wfmod.owned_te_nodes(wf)[0]
-        # Later user edit unrelated to TE wiring.
         wf["nodes"].append({"id": 99, "type": "UserAddedNode", "pos": [1, 1], "inputs": [], "outputs": []})
         ok, _ = wfmod.revert_one_node(wf, te)
         self.assertTrue(ok)
@@ -88,13 +114,31 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertEqual((links[10]["origin_id"], links[10]["target_id"]), (1, 2))
         self.assertEqual((links[11]["origin_id"], links[11]["target_id"]), (1, 3))
 
+    def test_lora_final_model_producer_is_supported(self):
+        wf = lora_workflow_fixture()
+        status, msg = wfmod.patch_container(wf)
+        self.assertEqual(status, "patched", msg)
+        te = wfmod.owned_te_nodes(wf)[0]
+        meta = te["properties"][wfmod.RESTORE_KEY]
+        self.assertEqual(meta["producer_id"], 1)
+        self.assertEqual(wf["nodes"][0]["type"], "LoraLoaderModelOnly")
+        self.assertEqual(te["widgets_values"][-1], "auto")
+
+    def test_divergent_scheduler_guider_branches_are_not_guessed(self):
+        wf = workflow_fixture()
+        wf["nodes"].append({"id": 6, "type": "ModelSampling", "pos": [400, 200], "inputs": [], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [11]}]})
+        links = {l["id"]: l for l in wf["links"]}
+        links[11]["origin_id"] = 6
+        status, _ = wfmod.patch_container(wf)
+        self.assertEqual(status, "skip")
+        self.assertFalse(wfmod.owned_te_nodes(wf))
+
     def test_revert_refuses_changed_te_wiring(self):
         wf = workflow_fixture()
         status, _ = wfmod.patch_container(wf)
         self.assertEqual(status, "patched")
         te = wfmod.owned_te_nodes(wf)[0]
         meta = te["properties"][wfmod.RESTORE_KEY]
-        # User rewired the TE -> scheduler link after install.
         for link in wf["links"]:
             if link["id"] == meta["te_to_scheduler_link_id"]:
                 link["target_id"] = 999
