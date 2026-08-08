@@ -1,16 +1,19 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-set "ROOT="
-if exist "%~dp0..\ComfyUI\comfy\ldm\minimax\model.py" for %%I in ("%~dp0..") do set "ROOT=%%~fI"
-if not defined ROOT if exist "%~dp0ComfyUI\comfy\ldm\minimax\model.py" for %%I in ("%~dp0.") do set "ROOT=%%~fI"
-for %%D in (C D E F G H) do if not defined ROOT if exist "%%D:\MiniMaxH3\ComfyUI\comfy\ldm\minimax\model.py" set "ROOT=%%D:\MiniMaxH3"
-if not defined ROOT set /p "ROOT=Enter MiniMaxH3 root path: "
-set "PY=%ROOT%\runtime\venv\Scripts\python.exe"
-if not exist "%PY%" (
-  echo [ERROR] Python env not found
-  goto :end
+cd /d "%~dp0"
+echo ============================================================
+echo   TE-Speed MiniMax H3 V3 Status Check
+echo ============================================================
+echo.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0TE-Speed-Launcher.ps1" -Action check
+set "RC=%ERRORLEVEL%"
+echo.
+if "%RC%"=="0" (
+  echo [PASS] TE-Speed core, node files and recognized workflows are healthy.
+) else (
+  echo [WARN] One or more TE-Speed checks did not pass. Read details above.
 )
-"%PY%" "%~dp0installer.py" check --root "%ROOT%"
-:end
+echo.
 pause
+exit /b %RC%
