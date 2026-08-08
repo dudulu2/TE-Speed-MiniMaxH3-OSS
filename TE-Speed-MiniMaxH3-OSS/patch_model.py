@@ -8,6 +8,7 @@ Safety rules:
 - Save the exact original block-loop text plus hashes in ComfyUI/.te_speed_minimaxh3.
 - Revert only our marked regions; preserve unrelated edits made after installation.
 - If a marked region was itself edited, stop instead of guessing/overwriting.
+- --preflight validates compatibility without writing anything.
 """
 
 from __future__ import annotations
@@ -18,26 +19,24 @@ import hashlib
 import json
 import re
 import shutil
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 TARGET = Path("comfy/ldm/minimax/model.py")
 STATE_DIR_NAME = ".te_speed_minimaxh3"
 STATE_FILE_NAME = "model_patch_state.json"
-PATCH_VERSION = 2
+PATCH_VERSION = 3
 
-RUN_BEGIN = "    # >>> TE_SPEED_MINIMAXH3_SAFE_V2:RUN_BLOCKS_BEGIN"
-RUN_END = "    # <<< TE_SPEED_MINIMAXH3_SAFE_V2:RUN_BLOCKS_END"
-LOOP_BEGIN = "        # >>> TE_SPEED_MINIMAXH3_SAFE_V2:BLOCK_LOOP_BEGIN"
-LOOP_END = "        # <<< TE_SPEED_MINIMAXH3_SAFE_V2:BLOCK_LOOP_END"
+RUN_BEGIN = "    # >>> TE_SPEED_MINIMAXH3_SAFE_V3:RUN_BLOCKS_BEGIN"
+RUN_END = "    # <<< TE_SPEED_MINIMAXH3_SAFE_V3:RUN_BLOCKS_END"
+LOOP_BEGIN = "        # >>> TE_SPEED_MINIMAXH3_SAFE_V3:BLOCK_LOOP_BEGIN"
+LOOP_END = "        # <<< TE_SPEED_MINIMAXH3_SAFE_V3:BLOCK_LOOP_END"
 
-COMMON_ROOTS = [
-    Path("."), Path(".."), Path("ComfyUI"), Path("../ComfyUI"),
-    Path("C:/ComfyUI"), Path("D:/ComfyUI"), Path("E:/ComfyUI"),
-    Path("F:/ComfyUI"), Path("G:/ComfyUI"),
-    Path("C:/Users/Administrator/ComfyUI"),
-]
+# V2 markers are accepted for safe migration/uninstall.
+V2_RUN_BEGIN = "    # >>> TE_SPEED_MINIMAXH3_SAFE_V2:RUN_BLOCKS_BEGIN"
+V2_RUN_END = "    # <<< TE_SPEED_MINIMAXH3_SAFE_V2:RUN_BLOCKS_END"
+V2_LOOP_BEGIN = "        # >>> TE_SPEED_MINIMAXH3_SAFE_V2:BLOCK_LOOP_BEGIN"
+V2_LOOP_END = "        # <<< TE_SPEED_MINIMAXH3_SAFE_V2:BLOCK_LOOP_END"
 
 RUN_BLOCKS_BODY = '''    def _run_blocks(self, h, t_emb, mod_segments, rope_freqs, transformer_options, start=0, end=None):
         patches_replace = transformer_options.get("patches_replace", {})
@@ -80,8 +79,6 @@ HOOK_LOOP_BODY = '''        patches_replace = transformer_options.get("patches_r
 RUN_BLOCKS_MARKED = RUN_BEGIN + "\n" + RUN_BLOCKS_BODY + RUN_END + "\n\n"
 HOOK_LOOP_MARKED = LOOP_BEGIN + "\n" + HOOK_LOOP_BODY + LOOP_END + "\n"
 
-# Current ComfyUI H3 stock loop. The beginning/end anchors are deliberately
-# strict enough that a changed upstream implementation is skipped, not guessed.
 LOOP_RE = re.compile(
     r'        patches_replace = transformer_options\.get\("patches_replace", \{\}\)\n'
     r'        blocks_replace = patches_replace\.get\("dit", \{\}\)\n'
@@ -129,15 +126,10 @@ def find_model_file(comfy_ui=None) -> Path:
             if candidate.is_file():
                 return candidate
         raise SystemExit(f"error: no model file below {p}")
-    for root in COMMON_ROOTS:
-        for candidate in (root / TARGET, root / "ComfyUI" / TARGET):
-            if candidate.is_file():
-                return candidate
-    raise SystemExit("error: could not locate ComfyUI; pass --comfy-ui <ComfyUI root>")
+    raise SystemExit("error: pass --comfy-ui <ComfyUI root>")
 
 
 def comfy_root_from_target(target: Path) -> Path:
-    # target = <ComfyUI>/comfy/ldm/minimax/model.py
     return target.parents[3]
 
 
@@ -146,12 +138,21 @@ def state_paths(target: Path) -> tuple[Path, Path]:
     return state_dir, state_dir / STATE_FILE_NAME
 
 
+def marker_set(text: str):
+    if all(x in text for x in (RUN_BEGIN, RUN_END, LOOP_BEGIN, LOOP_END)):
+        return "v3", (RUN_BEGIN, RUN_END, LOOP_BEGIN, LOOP_END)
+    if all(x in text for x in (V2_RUN_BEGIN, V2_RUN_END, V2_LOOP_BEGIN, V2_LOOP_END)):
+        return "v2", (V2_RUN_BEGIN, V2_RUN_END, V2_LOOP_BEGIN, V2_LOOP_END)
+    return None, None
+
+
 def has_safe_patch(text: str) -> bool:
-    return all(marker in text for marker in (RUN_BEGIN, RUN_END, LOOP_BEGIN, LOOP_END))
+    return marker_set(text)[0] is not None
 
 
 def has_any_safe_marker(text: str) -> bool:
-    return any(marker in text for marker in (RUN_BEGIN, RUN_END, LOOP_BEGIN, LOOP_END))
+    markers = (RUN_BEGIN, RUN_END, LOOP_BEGIN, LOOP_END, V2_RUN_BEGIN, V2_RUN_END, V2_LOOP_BEGIN, V2_LOOP_END)
+    return any(marker in text for marker in markers)
 
 
 def has_legacy_patch(text: str) -> bool:
@@ -195,15 +196,9 @@ def save_state(target: Path, original_loop: str, pre_raw: bytes, patched_raw: by
 def load_state(target: Path) -> dict:
     _, state_file = state_paths(target)
     if not state_file.is_file():
-        raise SystemExit(
-            "error: safe patch state is missing. Refusing to restore an old whole-file backup. "
-            "Current model.py was left untouched."
-        )
-    try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise SystemExit(f"error: invalid patch state {state_file}: {exc}")
-    if state.get("version") != PATCH_VERSION or not isinstance(state.get("original_loop"), str):
+        raise SystemExit("error: safe patch state is missing; current model.py was left untouched")
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    if state.get("version") not in {2, 3} or not isinstance(state.get("original_loop"), str):
         raise SystemExit("error: incompatible patch state; current model.py was left untouched")
     return state
 
@@ -214,20 +209,12 @@ def apply_patch(text: str) -> tuple[str, str]:
             return text, ""
         raise SystemExit("error: partial TE-Speed safe markers found; refusing to guess")
     if has_legacy_patch(text):
-        raise SystemExit(
-            "error: legacy TE-Speed patch detected. Safely uninstall the legacy package first; "
-            "this installer will not overwrite an untracked patch."
-        )
+        raise SystemExit("error: legacy TE-Speed patch detected; uninstall the legacy package first")
     match = LOOP_RE.search(text)
     if not match:
         if '("block_loop", 0) in blocks_replace' in text:
-            raise SystemExit(
-                "error: model.py already has a block_loop implementation not owned by this installer; left untouched"
-            )
-        raise SystemExit(
-            "error: expected stock MiniMax H3 block loop was not found. "
-            "This ComfyUI version may differ; left untouched."
-        )
+            raise SystemExit("error: model.py already has an unowned block_loop implementation; left untouched")
+        raise SystemExit("error: expected stock MiniMax H3 block loop was not found; left untouched")
     if FORWARD_ANCHOR not in text:
         raise SystemExit("error: MiniMaxH3Model.forward anchor not found; left untouched")
     original_loop = match.group(0)
@@ -239,20 +226,39 @@ def apply_patch(text: str) -> tuple[str, str]:
     return patched, original_loop
 
 
+def preflight(target: Path) -> int:
+    text, _ = normalize_newlines(target.read_bytes())
+    if has_safe_patch(text):
+        print(f"[OK] safe TE-Speed hooks already present: {target}")
+        return 0
+    try:
+        patched, _ = apply_patch(text)
+        ast.parse(patched)
+    except SystemExit as exc:
+        print(str(exc))
+        return 2
+    print(f"[OK] MiniMax H3 core is compatible with TE-Speed safe patch: {target}")
+    return 0
+
+
 def revert_patch(text: str, state: dict) -> str:
-    if not has_any_safe_marker(text):
-        if has_legacy_patch(text):
-            raise SystemExit("error: legacy/untracked TE-Speed patch detected; refusing unsafe rollback")
-        print("TE-Speed: safe patch markers are absent; model.py already appears unpatched. Leaving it untouched.")
-        return text
-    if not has_safe_patch(text):
+    version, markers = marker_set(text)
+    if version is None:
+        if not has_any_safe_marker(text):
+            if has_legacy_patch(text):
+                raise SystemExit("error: legacy/untracked TE-Speed patch detected; refusing unsafe rollback")
+            print("TE-Speed: safe patch markers are absent; model.py already appears unpatched.")
+            return text
         raise SystemExit("error: partial safe markers found; refusing unsafe rollback")
 
-    run_region = extract_marked(text, RUN_BEGIN, RUN_END)
-    loop_region = extract_marked(text, LOOP_BEGIN, LOOP_END)
+    run_begin, run_end, loop_begin, loop_end = markers
+    run_region = extract_marked(text, run_begin, run_end)
+    loop_region = extract_marked(text, loop_begin, loop_end)
     if run_region is None or loop_region is None:
         raise SystemExit("error: could not isolate safe patch regions; left untouched")
 
+    # V3 verifies exact owned regions. V2 state also contains hashes; retain the
+    # same protection for migration/uninstall.
     if sha256_text(run_region.rstrip("\n")) != state.get("run_region_sha256"):
         raise SystemExit("error: TE-Speed _run_blocks region was edited after install; left untouched")
     if sha256_text(loop_region.rstrip("\n")) != state.get("loop_region_sha256"):
@@ -274,10 +280,8 @@ def install(target: Path) -> int:
         return 0
     patched, original_loop = apply_patch(text)
     patched_raw = encode_with_newline(patched, newline)
-    # Save state/recovery before writing the target. State contains enough data for surgical rollback.
     save_state(target, original_loop, pre_raw, patched_raw)
     target.write_bytes(patched_raw)
-    # Read-after-write verification.
     verify, _ = normalize_newlines(target.read_bytes())
     if not has_safe_patch(verify):
         raise SystemExit("error: write verification failed")
@@ -295,16 +299,16 @@ def revert(target: Path) -> int:
     restored = revert_patch(text, state)
     if restored == text:
         return 0
-    restored_raw = encode_with_newline(restored, newline)
-    target.write_bytes(restored_raw)
+    target.write_bytes(encode_with_newline(restored, newline))
     print("TE-Speed: removed only TE-Speed model hooks; unrelated model.py edits were preserved.")
     return 0
 
 
 def check(target: Path) -> int:
     text, _ = normalize_newlines(target.read_bytes())
-    if has_safe_patch(text):
-        print(f"[ON] safe TE-Speed hooks present: {target}")
+    version, _ = marker_set(text)
+    if version:
+        print(f"[ON] safe TE-Speed hooks present ({version}): {target}")
         return 0
     if has_legacy_patch(text):
         print(f"[WARN] legacy/untracked TE-Speed hooks present: {target}")
@@ -322,14 +326,22 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--revert", action="store_true")
     group.add_argument("--check", action="store_true")
+    group.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     target = find_model_file(args.comfy_ui)
     try:
-        code = revert(target) if args.revert else check(target) if args.check else install(target)
+        if args.revert:
+            code = revert(target)
+        elif args.check:
+            code = check(target)
+        elif args.preflight:
+            code = preflight(target)
+        else:
+            code = install(target)
     except SystemExit:
         raise
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {exc}")
         code = 2
     raise SystemExit(code)
 
