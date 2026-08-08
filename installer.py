@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -16,7 +15,7 @@ from pathlib import Path
 PACKAGE_DIR_NAME = "TE-Speed-MiniMaxH3-OSS"
 STATE_DIR_NAME = ".te_speed_minimaxh3"
 NODE_MANIFEST = "node_manifest.json"
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 
 def sha256_file(path: Path) -> str:
@@ -42,12 +41,16 @@ def source_files(src: Path):
 
 
 def validate_root(root: Path):
+    """Accept either <bundle root> or the ComfyUI root itself."""
     root = root.resolve()
-    comfy = root / "ComfyUI"
-    model = comfy / "comfy" / "ldm" / "minimax" / "model.py"
-    if not model.is_file():
-        raise RuntimeError(f"not a MiniMaxH3/ComfyUI root: missing {model}")
-    return root, comfy
+    candidates = [root, root / "ComfyUI"]
+    for comfy in candidates:
+        model = comfy / "comfy" / "ldm" / "minimax" / "model.py"
+        if model.is_file() and (comfy / "custom_nodes").is_dir():
+            return root, comfy
+    raise RuntimeError(
+        f"not a recognized MiniMaxH3/ComfyUI root: {root}; expected comfy/ldm/minimax/model.py and custom_nodes"
+    )
 
 
 def state_dir(comfy: Path) -> Path:
@@ -56,21 +59,25 @@ def state_dir(comfy: Path) -> Path:
     return p
 
 
+def manifest_path(comfy: Path) -> Path:
+    return state_dir(comfy) / NODE_MANIFEST
+
+
 def load_manifest(comfy: Path):
-    p = state_dir(comfy) / NODE_MANIFEST
+    p = manifest_path(comfy)
     if not p.is_file():
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"invalid node manifest {p}: {exc}")
-    if data.get("version") != MANIFEST_VERSION or not isinstance(data.get("files"), dict):
+    if data.get("version") not in {2, 3} or not isinstance(data.get("files"), dict):
         raise RuntimeError(f"unsupported node manifest {p}")
     return data
 
 
 def save_manifest(comfy: Path, files: dict[str, str]):
-    p = state_dir(comfy) / NODE_MANIFEST
+    p = manifest_path(comfy)
     p.write_text(json.dumps({
         "version": MANIFEST_VERSION,
         "installed_at_utc": utc_stamp(),
@@ -122,10 +129,11 @@ def sync_node(src: Path, dst: Path, comfy: Path):
     return installed
 
 
-def remove_owned_node(dst: Path, comfy: Path):
+def remove_owned_node(dst: Path, comfy: Path, *, quiet_missing=False):
     manifest = load_manifest(comfy)
     if not manifest:
-        print("[WARN] node manifest is missing; node folder was left untouched for safety")
+        if not quiet_missing:
+            print("[WARN] node manifest is missing; node folder was left untouched for safety")
         return 1
     kept = []
     removed = 0
@@ -151,17 +159,48 @@ def remove_owned_node(dst: Path, comfy: Path):
     if kept:
         print("[WARN] modified/untracked node files were preserved: " + ", ".join(kept[:8]))
         return 1
+    try:
+        manifest_path(comfy).unlink()
+    except FileNotFoundError:
+        pass
     print(f"[OK] removed {removed} installer-owned node files")
     return 0
 
+
+def check_node(dst: Path, comfy: Path) -> int:
+    manifest = load_manifest(comfy)
+    if not manifest:
+        print("[OFF] custom node manifest missing")
+        return 1
+    missing = []
+    changed = []
+    for rel_s, expected in manifest["files"].items():
+        dp = dst / Path(rel_s)
+        if not dp.is_file():
+            missing.append(rel_s)
+        elif sha256_file(dp) != expected:
+            changed.append(rel_s)
+    if missing:
+        print("[ERROR] custom node files missing: " + ", ".join(missing[:8]))
+    if changed:
+        print("[ERROR] custom node files changed since install: " + ", ".join(changed[:8]))
+    if missing or changed:
+        return 1
+    required = [dst / "__init__.py", dst / "nodes.py", dst / "patch_model.py", dst / "tespeed_workflow_patch.py"]
+    absent = [str(p.name) for p in required if not p.is_file()]
+    if absent:
+        print("[ERROR] required custom node payload missing: " + ", ".join(absent))
+        return 1
+    print(f"[ON] custom node manifest/hash check passed: {dst}")
+    return 0
 
 
 def workflow_dirs(comfy: Path):
     user = comfy / "user"
     if not user.is_dir():
         return []
-    dirs = sorted({p for p in user.rglob("workflows") if p.is_dir()})
-    return dirs
+    return sorted({p for p in user.rglob("workflows") if p.is_dir()})
+
 
 def run_py(script: Path, *args: str) -> int:
     cmd = [sys.executable, str(script), *map(str, args)]
@@ -171,50 +210,59 @@ def run_py(script: Path, *args: str) -> int:
 
 
 def install(root: Path, package_root: Path) -> int:
-    root, comfy = validate_root(root)
+    _, comfy = validate_root(root)
     src = package_root / PACKAGE_DIR_NAME
     if not (src / "nodes.py").is_file():
         raise RuntimeError(f"package incomplete: {src / 'nodes.py'} missing")
     dst = comfy / "custom_nodes" / PACKAGE_DIR_NAME
     workflows = workflow_dirs(comfy)
 
-    # Preflight BEFORE touching anything.
+    # Full preflight before modifying anything we own.
     preflight_node_sync(src, dst, comfy)
-
-    sync_node(src, dst, comfy)
-
-    code = run_py(src / "patch_model.py", "--comfy-ui", str(comfy))
-    if code != 0:
-        print("[ERROR] model hook install failed. Workflows were not changed.")
-        print("        Node files may remain, but they are inert without the model hook.")
+    preflight = run_py(src / "patch_model.py", "--preflight", "--comfy-ui", str(comfy))
+    if preflight != 0:
+        print("[STOP] MiniMax H3 core is not patch-compatible; nothing was installed.")
         return 2
 
-    wf_warning = False
-    if workflows:
-        code = run_py(src / "tespeed_workflow_patch.py", "--add", *[str(p) for p in workflows])
-        if code != 0:
-            wf_warning = True
-            print("[WARN] one or more workflows were not auto-wired because the script refused an ambiguous layout.")
-    else:
-        print("[WARN] no ComfyUI user workflow directories found; workflow auto-wiring skipped")
-        wf_warning = True
+    node_synced = False
+    model_patched = False
+    try:
+        sync_node(src, dst, comfy)
+        node_synced = True
 
-    print("[OK] TE-Speed core installation is complete.")
-    if wf_warning:
-        print("[WARN] Acceleration is active only in workflows that contain the TESpeedMiniMaxH3 node.")
-        return 1
-    print("[OK] Matching MiniMax H3 workflows were wired automatically.")
-    return 0
+        code = run_py(src / "patch_model.py", "--comfy-ui", str(comfy))
+        if code != 0:
+            raise RuntimeError("model hook install failed")
+        model_patched = True
+
+        wf_warning = False
+        if workflows:
+            code = run_py(src / "tespeed_workflow_patch.py", "--add", *[str(p) for p in workflows])
+            if code != 0:
+                wf_warning = True
+                print("[WARN] one or more workflows were ambiguous and were not auto-wired.")
+        else:
+            print("[WARN] no ComfyUI user workflow directories found; workflow auto-wiring skipped")
+            wf_warning = True
+
+        print("[OK] TE-Speed core installation is complete.")
+        return 1 if wf_warning else 0
+    except Exception as exc:
+        print(f"[ERROR] installation failed: {exc}")
+        print("[ROLLBACK] attempting to remove only changes made by this installation...")
+        if model_patched:
+            run_py(src / "patch_model.py", "--revert", "--comfy-ui", str(comfy))
+        if node_synced:
+            remove_owned_node(dst, comfy, quiet_missing=True)
+        return 2
 
 
 def uninstall(root: Path, package_root: Path) -> int:
-    root, comfy = validate_root(root)
+    _, comfy = validate_root(root)
     src = package_root / PACKAGE_DIR_NAME
     dst = comfy / "custom_nodes" / PACKAGE_DIR_NAME
     workflows = workflow_dirs(comfy)
 
-    # First remove workflow dependency. If any owned TE wiring was edited by the user,
-    # STOP and keep model hook + node installed so those workflows do not break.
     if workflows:
         code = run_py(src / "tespeed_workflow_patch.py", "--revert", *[str(p) for p in workflows])
         if code != 0:
@@ -222,7 +270,6 @@ def uninstall(root: Path, package_root: Path) -> int:
             print("       Nothing else was removed. Fix/reconnect that workflow, then run uninstall again.")
             return 2
 
-    # Next remove only our marked model.py regions. Never restore a stale whole file.
     code = run_py(src / "patch_model.py", "--revert", "--comfy-ui", str(comfy))
     if code != 0:
         print("[STOP] model.py safe rollback refused. The custom node was kept installed.")
@@ -234,20 +281,31 @@ def uninstall(root: Path, package_root: Path) -> int:
 
 
 def check(root: Path, package_root: Path) -> int:
-    root, comfy = validate_root(root)
+    _, comfy = validate_root(root)
     src = package_root / PACKAGE_DIR_NAME
+    dst = comfy / "custom_nodes" / PACKAGE_DIR_NAME
     workflows = workflow_dirs(comfy)
-    c1 = run_py(src / "patch_model.py", "--check", "--comfy-ui", str(comfy))
-    c2 = 0
+
+    print("=== TE-Speed V3 health check ===")
+    c_model = run_py(src / "patch_model.py", "--check", "--comfy-ui", str(comfy))
+    c_node = check_node(dst, comfy)
+    c_workflow = 0
     if workflows:
-        c2 = run_py(src / "tespeed_workflow_patch.py", "--check", *[str(p) for p in workflows])
-    return 0 if c1 == 0 and c2 == 0 else 1
+        c_workflow = run_py(src / "tespeed_workflow_patch.py", "--check", *[str(p) for p in workflows])
+    else:
+        print("[INFO] no user workflow directories found; workflow check not applicable")
+
+    if c_model == 0 and c_node == 0 and c_workflow == 0:
+        print("[PASS] TE-Speed installation is healthy.")
+        return 0
+    print(f"[WARN] health check failed: model={c_model}, node={c_node}, workflow={c_workflow}")
+    return 1
 
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMax H3 TE-Speed safe one-click installer")
     parser.add_argument("action", choices=["install", "uninstall", "check"])
-    parser.add_argument("--root", required=True, help="MiniMaxH3 bundle root containing ComfyUI and runtime")
+    parser.add_argument("--root", required=True, help="MiniMaxH3 bundle root or ComfyUI root")
     args = parser.parse_args()
     package_root = Path(__file__).resolve().parent
     try:
